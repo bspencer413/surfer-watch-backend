@@ -124,7 +124,7 @@ class WatchlistItem(BaseModel):
 
 # ── App ────────────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="Surfer Watch API", version="0.2.0")
+app = FastAPI(title="Surfer Watch API", version="0.2.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -166,7 +166,7 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
 @app.api_route("/health", methods=["GET", "HEAD"])
 async def health_check():
     return {"status": "healthy", "timestamp": datetime.now().isoformat(),
-            "version": "0.2.0", "app": "Surfer Watch"}
+            "version": "0.2.1", "app": "Surfer Watch"}
 
 # ── Auth ───────────────────────────────────────────────────────────────────────
 
@@ -673,10 +673,11 @@ async def get_news_for_surfer(surfer_name: str, limit: int = 10):
         return {"surfer": surfer_name, "articles": articles}
 
 
-@app.post("/admin/run-news-cron")
+@app.api_route("/admin/run-news-cron", methods=["GET", "POST"])
 async def run_news_cron_manually(secret: str):
     """Manually trigger the daily news cache update. Useful for testing without
-    waiting for the 13:00 UTC schedule. Pass ?secret=... matching ADMIN_SECRET."""
+    waiting for the 13:00 UTC schedule. Pass ?secret=... matching ADMIN_SECRET.
+    Accepts GET so you can trigger it by pasting the URL in a browser."""
     if secret != os.environ.get("ADMIN_SECRET", "surferwatch-cron-2026"):
         raise HTTPException(status_code=403, detail="Forbidden")
     update_news_cache_for_all_roster()
