@@ -14,6 +14,12 @@ import json as json_lib
 from contextlib import contextmanager
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+import hashlib
+import time
+import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
+
+from wsl_data import all_surfers, detect_surfers_in_text, event_for_date
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
@@ -68,6 +74,21 @@ def init_db():
         captured_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (watchlist_id) REFERENCES surf_watchlist (id)
     )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS surf_news_cache (
+        id SERIAL PRIMARY KEY,
+        article_url_hash VARCHAR(64) UNIQUE NOT NULL,
+        article_url TEXT NOT NULL,
+        title TEXT NOT NULL,
+        source TEXT,
+        excerpt TEXT,
+        published_at TIMESTAMP,
+        surfer_mentions JSONB NOT NULL,
+        is_meet_recap BOOLEAN DEFAULT FALSE,
+        related_event_stop INTEGER,
+        fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_surf_news_mentions ON surf_news_cache USING GIN (surfer_mentions)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_surf_news_published ON surf_news_cache (published_at DESC NULLS LAST)")
     conn.commit()
     conn.close()
 
@@ -103,7 +124,7 @@ class WatchlistItem(BaseModel):
 
 # ── App ────────────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="Surfer Watch API", version="0.1.0")
+app = FastAPI(title="Surfer Watch API", version="0.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -145,7 +166,7 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
 @app.api_route("/health", methods=["GET", "HEAD"])
 async def health_check():
     return {"status": "healthy", "timestamp": datetime.now().isoformat(),
-            "version": "0.1.0", "app": "Surfer Watch"}
+            "version": "0.2.0", "app": "Surfer Watch"}
 
 # ── Auth ───────────────────────────────────────────────────────────────────────
 
@@ -472,6 +493,196 @@ def check_all_watched_players():
         print("[cron] Fatal error: " + str(e))
 
 
+NEWS_USER_AGENT = "SurferWatch/0.2 (+https://surfer.watch)"
+
+
+def _url_hash(url):
+    return hashlib.sha1(url.encode("utf-8")).hexdigest()
+
+
+def fetch_news_for_surfer(surfer):
+    """Fetch news for a surfer via Google News RSS.
+
+    Query: surfer's primary name + ' surf' qualifier to filter out non-surfing
+    namesakes. Returns list of article dicts with url/title/source/published_at/excerpt.
+    """
+    name = surfer["name"]
+    query = '"' + name + '" surf'
+    rss_url = ("https://news.google.com/rss/search?q=" +
+               urllib.parse.quote(query) +
+               "&hl=en-US&gl=US&ceid=US:en")
+
+    req = urllib.request.Request(rss_url, headers={"User-Agent": NEWS_USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            xml_bytes = resp.read()
+    except Exception as e:
+        print("[news] Fetch failed for " + name + ": " + str(e))
+        return []
+
+    try:
+        root = ET.fromstring(xml_bytes)
+    except Exception as e:
+        print("[news] XML parse failed for " + name + ": " + str(e))
+        return []
+
+    articles = []
+    for item in root.findall(".//item"):
+        link_el = item.find("link")
+        title_el = item.find("title")
+        pub_el = item.find("pubDate")
+        source_el = item.find("source")
+        desc_el = item.find("description")
+
+        if link_el is None or title_el is None:
+            continue
+
+        url_val = (link_el.text or "").strip()
+        title_val = (title_el.text or "").strip()
+        if not url_val or not title_val:
+            continue
+
+        source_val = source_el.text if source_el is not None else None
+        excerpt_val = desc_el.text if desc_el is not None else ""
+
+        published = None
+        if pub_el is not None and pub_el.text:
+            try:
+                published = parsedate_to_datetime(pub_el.text)
+            except Exception:
+                published = None
+
+        articles.append({
+            "url": url_val,
+            "title": title_val,
+            "source": source_val,
+            "published_at": published,
+            "excerpt": excerpt_val or "",
+        })
+
+    return articles
+
+
+def update_news_cache_for_all_roster():
+    """Fetch news for every roster surfer, dedupe against cache, insert new articles.
+    For each new article: detect multi-surfer mentions (meet-recap inference) and
+    cross-reference publish date with the schedule."""
+    print("[news] Starting roster news fetch")
+
+    inserted = 0
+    duplicates = 0
+    failed = 0
+
+    with get_db() as conn:
+        c = conn.cursor()
+
+        for surfer in all_surfers():
+            try:
+                articles = fetch_news_for_surfer(surfer)
+            except Exception as e:
+                print("[news] Iteration failed for " + surfer["name"] + ": " + str(e))
+                failed += 1
+                time.sleep(0.5)
+                continue
+
+            for article in articles:
+                try:
+                    url_h = _url_hash(article["url"])
+
+                    c.execute("SELECT 1 FROM surf_news_cache WHERE article_url_hash = %s", (url_h,))
+                    if c.fetchone():
+                        duplicates += 1
+                        continue
+
+                    scan_text = article["title"] + " " + (article["excerpt"] or "")
+                    mentions = detect_surfers_in_text(scan_text)
+                    is_meet_recap = len(mentions) >= 2
+
+                    related_event = None
+                    if article["published_at"]:
+                        try:
+                            pub_date = article["published_at"].date()
+                            ev = event_for_date(pub_date)
+                            if ev:
+                                related_event = ev["stop"]
+                        except Exception:
+                            related_event = None
+
+                    c.execute(
+                        "INSERT INTO surf_news_cache "
+                        "(article_url_hash, article_url, title, source, excerpt, "
+                        " published_at, surfer_mentions, is_meet_recap, related_event_stop) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                        (url_h, article["url"], article["title"], article["source"],
+                         article["excerpt"], article["published_at"],
+                         json_lib.dumps(mentions), is_meet_recap, related_event)
+                    )
+                    inserted += 1
+                except Exception as e:
+                    print("[news] Insert failed: " + str(e))
+                    continue
+
+            # Polite rate-limit between Google News RSS fetches
+            time.sleep(0.5)
+
+        conn.commit()
+
+    print("[news] Done: " + str(inserted) + " new, " +
+          str(duplicates) + " duplicates, " +
+          str(failed) + " surfer fetches failed")
+
+
+@app.get("/news/{surfer_name}")
+async def get_news_for_surfer(surfer_name: str, limit: int = 10):
+    """Return cached news articles mentioning the given surfer.
+    Queries by JSONB containment on surfer_mentions, ordered by publish date desc."""
+    if limit < 1:
+        limit = 1
+    if limit > 50:
+        limit = 50
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute(
+            "SELECT article_url, title, source, excerpt, published_at, "
+            "       surfer_mentions, is_meet_recap, related_event_stop "
+            "FROM surf_news_cache "
+            "WHERE surfer_mentions @> %s::jsonb "
+            "ORDER BY published_at DESC NULLS LAST "
+            "LIMIT %s",
+            (json_lib.dumps([surfer_name]), limit)
+        )
+        rows = c.fetchall()
+        articles = []
+        for r in rows:
+            mentions = r[5]
+            if isinstance(mentions, str):
+                try:
+                    mentions = json_lib.loads(mentions)
+                except Exception:
+                    mentions = []
+            articles.append({
+                "url": r[0],
+                "title": r[1],
+                "source": r[2],
+                "excerpt": r[3],
+                "published_at": r[4].isoformat() if r[4] else None,
+                "surfer_mentions": mentions or [],
+                "is_meet_recap": bool(r[6]),
+                "related_event_stop": r[7],
+            })
+        return {"surfer": surfer_name, "articles": articles}
+
+
+@app.post("/admin/run-news-cron")
+async def run_news_cron_manually(secret: str):
+    """Manually trigger the daily news cache update. Useful for testing without
+    waiting for the 13:00 UTC schedule. Pass ?secret=... matching ADMIN_SECRET."""
+    if secret != os.environ.get("ADMIN_SECRET", "surferwatch-cron-2026"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    update_news_cache_for_all_roster()
+    return {"status": "completed", "ran_at": datetime.now().isoformat()}
+
+
 @app.post("/admin/run-cron")
 async def run_cron_manually(secret: str):
     """Manually trigger the daily watchlist check. Useful for testing without
@@ -531,8 +742,14 @@ async def startup_event():
         id="pw_daily_check",
         replace_existing=True,
     )
+    _pw_scheduler.add_job(
+        update_news_cache_for_all_roster,
+        CronTrigger(hour=13, minute=0),
+        id="surf_news_daily",
+        replace_existing=True,
+    )
     _pw_scheduler.start()
-    print("Surfer Watch cron scheduled: daily at 14:00 UTC")
+    print("Surfer Watch cron scheduled: news at 13:00 UTC, watchlist check at 14:00 UTC")
 
 if __name__ == "__main__":
     import uvicorn
