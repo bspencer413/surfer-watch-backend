@@ -400,6 +400,27 @@ def build_alert_snapshot(meta_json):
     }
 
 
+def build_news_alert_snapshot(name):
+    """Surfer-specific snapshot: recent article hashes + titles from surf_news_cache.
+    Used as fallback when build_alert_snapshot returns None (surfers have no ESPN data).
+    Returns dict with 'type' = 'news' and 'articles' list, or None if name is empty."""
+    if not name:
+        return None
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("""SELECT article_url_hash, title FROM surf_news_cache
+                         WHERE %s = ANY(surfer_mentions)
+                         ORDER BY published_at DESC NULLS LAST
+                         LIMIT 30""", (name,))
+            rows = c.fetchall()
+        articles = [{"hash": r[0], "title": r[1] or ""} for r in rows]
+        return {"type": "news", "articles": articles}
+    except Exception as e:
+        print("[cron] news snapshot failed for " + name + ": " + str(e))
+        return None
+
+
 def diff_snapshots(old, new):
     """Compare two alert snapshots. Returns list of short alert message strings.
     First-run (old is None) returns []  — we never alert on the first capture."""
@@ -426,6 +447,26 @@ def diff_snapshots(old, new):
     return alerts
 
 
+def diff_news_snapshots(old, new):
+    """Return alert messages for articles in new that weren't in old (by URL hash).
+    First-run (old is None) returns [] — we never alert on the first capture."""
+    if old is None or new is None:
+        return []
+    if not new.get("articles"):
+        return []
+    old_hashes = set()
+    if isinstance(old.get("articles"), list):
+        old_hashes = {a.get("hash") for a in old["articles"] if a.get("hash")}
+    alerts = []
+    for art in new["articles"]:
+        h = art.get("hash")
+        title = art.get("title", "")
+        if h and h not in old_hashes and title:
+            msg = title if len(title) <= 140 else (title[:137] + "...")
+            alerts.append("New article: " + msg)
+    return alerts
+
+
 def check_all_watched_players():
     """Daily job: iterate active watchlist, fetch ESPN, diff, write notifications."""
     print("[cron] Starting daily watchlist check at " + datetime.now().isoformat())
@@ -445,6 +486,9 @@ def check_all_watched_players():
             watchlist_id, user_id, name, location = row
             new_snap = build_alert_snapshot(location)
             if new_snap is None:
+                # Fallback: surfers have no ESPN data — use news-cache snapshot
+                new_snap = build_news_alert_snapshot(name)
+            if new_snap is None:
                 skipped += 1
                 continue
             checked += 1
@@ -462,8 +506,11 @@ def check_all_watched_players():
                 except Exception:
                     old_snap = None
 
-            # Diff and write any alerts
-            alerts = diff_snapshots(old_snap, new_snap)
+            # Diff and write any alerts (dispatch by snapshot type)
+            if isinstance(new_snap, dict) and new_snap.get("type") == "news":
+                alerts = diff_news_snapshots(old_snap, new_snap)
+            else:
+                alerts = diff_snapshots(old_snap, new_snap)
             if alerts:
                 with get_db() as conn:
                     c = conn.cursor()
@@ -487,8 +534,8 @@ def check_all_watched_players():
                 conn.commit()
 
         print("[cron] Done. Checked " + str(checked)
-              + " players, " + str(alerted) + " with new alerts, "
-              + str(skipped) + " skipped (no ESPN id or fetch failed)")
+              + " items, " + str(alerted) + " with new alerts, "
+              + str(skipped) + " skipped (no ESPN data and no news matches)")
     except Exception as e:
         print("[cron] Fatal error: " + str(e))
 
